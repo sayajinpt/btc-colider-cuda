@@ -1,7 +1,10 @@
 # btc-colider-cuda
 btc colider similar to bitcrack but all compressed in a single file for easyer understanding. the code its easy to modefy/improve.
+
 all computations are done on gpu.
+
 multi gpu suport (not tested)
+
 here some benchmarks on my gpu nvidia 3060 producing around 20 million keys processed per second.
 
 <img width="1226" height="984" alt="Captura de Ecrã (30)" src="https://github.com/user-attachments/assets/f1a75589-deca-43e2-bf71-9f43bce6f656" />
