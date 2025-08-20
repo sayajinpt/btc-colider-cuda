@@ -9,13 +9,43 @@
 #include <fstream>
 #include <iomanip>
 #include <ctime>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
+// -------------------- Configuration --------------------
+struct Config {
+    int intensity_level = 3;  // Default intensity (90%)
+    int blocks = 0;           // Will be calculated based on intensity
+    int tpb = 0;              // Will be calculated based on intensity
+    uint32_t keys_per_thread = 0; // Will be calculated based on intensity
+};
+
 // -------------------- Big ints --------------------
 struct Big256 { uint32_t w[8]; };
 struct Big512 { uint32_t w[16]; };
+
+// -------------------- GPU Configuration --------------------
+struct GPUConfig {
+    int device_id;
+    int intensity_level;
+    int blocks;
+    int tpb;
+    uint32_t keys_per_thread;
+    Big256 start_key;
+    Big256 end_key;
+    uint64_t keys_processed;
+    bool found;
+    Big256 found_key;
+    char found_address[36];
+};
+
+// -------------------- Global Variables --------------------
+std::atomic<bool> global_found(false);
+std::mutex output_mutex;
 
 __device__ char d_target_address[36];
 
@@ -592,15 +622,221 @@ void save_collision_result(const Big256& priv_key, const char* address, const ch
     file << "\nAddress: " << address << "\n\n";
 }
 
+// -------------------- Multi-GPU Helper Functions --------------------
+uint64_t big256_to_uint64(const Big256& big) {
+    uint64_t result = 0;
+    for (int i = 0; i < 4; i++) {
+        result += (uint64_t)big.w[i] << (i * 8);
+    }
+    return result;
+}
+
+void configure_intensity(GPUConfig& config, cudaDeviceProp& prop) {
+    int max_threads_per_mp = prop.maxThreadsPerMultiProcessor;
+    int mp_count = prop.multiProcessorCount;
+
+    int target_blocks = mp_count * 6;
+    int target_tpb = 256;
+    uint32_t target_keys = 1024;
+
+    switch (config.intensity_level) {
+    case 1: // 30% workload
+        target_blocks = (int)(mp_count * 2 * 0.4);
+        target_tpb = (int)(256 * 0.4);
+        target_keys = (uint32_t)(1024 * 0.4);
+        break;
+    case 2: // 60% workload
+        target_blocks = (int)(mp_count * 4 * 0.8);
+        target_tpb = (int)(256 * 0.8);
+        target_keys = (uint32_t)(1024 * 0.8);
+        break;
+    case 3: // 90% workload (default)
+        target_blocks = (int)(mp_count * 8 * 0.97);
+        target_tpb = (int)(256 * 0.97);
+        target_keys = (uint32_t)(1024 * 0.97);
+        break;
+    case 4: // 100% workload
+        target_blocks = mp_count * 8;
+        target_tpb = 512;
+        target_keys = 2048;
+        break;
+    default:
+        target_blocks = (int)(mp_count * 8 * 0.97);
+        target_tpb = (int)(256 * 0.97);
+        target_keys = (uint32_t)(1024 * 0.97);
+        break;
+    }
+
+    config.blocks = std::max(1, target_blocks);
+    config.tpb = std::max(32, target_tpb);
+    config.keys_per_thread = std::max(1u, target_keys);
+
+    if (config.intensity_level != 4) {
+        config.tpb = std::min(config.tpb, prop.maxThreadsPerBlock);
+        config.blocks = std::min(config.blocks, 65535);
+    }
+    else {
+        config.blocks = std::min(config.blocks, 65535);
+    }
+}
+
+std::vector<GPUConfig> initialize_gpu_configs(int device_count, const Big256& startKey,
+    const Big256& endKey, int intensity_level) {
+    std::vector<GPUConfig> configs(device_count);
+
+    // Calculate approximate total range
+    Big256 total_range;
+    sub256(endKey, startKey, total_range);
+    uint64_t approx_total = big256_to_uint64(total_range);
+    uint64_t keys_per_gpu = approx_total / device_count;
+
+    for (int i = 0; i < device_count; i++) {
+        GPUConfig& config = configs[i];
+        config.device_id = i;
+        config.intensity_level = intensity_level;
+
+        // Set key ranges
+        if (i == 0) {
+            config.start_key = startKey;
+        }
+        else {
+            add_uint64_to_big256(configs[i - 1].end_key, 1, config.start_key);
+        }
+
+        if (i == device_count - 1) {
+            config.end_key = endKey;
+        }
+        else {
+            add_uint64_to_big256(config.start_key, keys_per_gpu, config.end_key);
+        }
+
+        // Configure device-specific intensity
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, i);
+        configure_intensity(config, prop);
+
+        config.found = false;
+        config.keys_processed = 0;
+    }
+
+    return configs;
+}
+
+void gpu_worker(GPUConfig& config, const char* target_address,
+    PointJ* d_precomp, int precomp_table_size, int window_bits) {
+
+    cudaSetDevice(config.device_id);
+
+    // Device variables
+    unsigned long long* d_processed = nullptr;
+    bool* d_found = nullptr;
+    Big256* d_found_key = nullptr;
+    char* d_found_address = nullptr;
+
+    // Allocate device memory
+    cudaMalloc(&d_processed, sizeof(unsigned long long));
+    cudaMalloc(&d_found, sizeof(bool));
+    cudaMalloc(&d_found_key, sizeof(Big256));
+    cudaMalloc(&d_found_address, 36 * sizeof(char));
+
+    // Copy target address to device
+    char h_target_address[36] = { 0 };
+    strncpy(h_target_address, target_address, 35);
+    cudaMemcpyToSymbol(d_target_address, h_target_address, 36);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    auto last_log = std::chrono::steady_clock::now();
+    uint64_t local_processed = 0;
+
+    while (cmp256(config.start_key, config.end_key) <= 0 && !global_found.load()) {
+        // Reset counters
+        unsigned long long zero = 0;
+        bool false_val = false;
+        cudaMemcpy(d_processed, &zero, sizeof(zero), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_found, &false_val, sizeof(false_val), cudaMemcpyHostToDevice);
+
+        // Launch kernel
+        cudaEventRecord(start);
+        collision_kernel << <config.blocks, config.tpb >> > (
+            config.start_key, config.end_key, config.keys_per_thread,
+            d_processed, d_found, d_found_key, d_found_address,
+            d_precomp, precomp_table_size, window_bits
+            );
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+
+        // Check for collision
+        bool found = false;
+        cudaMemcpy(&found, d_found, sizeof(found), cudaMemcpyDeviceToHost);
+
+        if (found) {
+            std::lock_guard<std::mutex> lock(output_mutex);
+            global_found.store(true);
+            config.found = true;
+
+            cudaMemcpy(&config.found_key, d_found_key, sizeof(Big256), cudaMemcpyDeviceToHost);
+            cudaMemcpy(config.found_address, d_found_address, 36, cudaMemcpyDeviceToHost);
+
+            printf("\n=== COLLISION FOUND on GPU %d ===\n", config.device_id);
+            printf("Private key: 0x");
+            print_hex256(config.found_key);
+            printf("\nAddress: %s\n", config.found_address);
+            printf("Matches target: %s\n", target_address);
+
+            save_collision_result(config.found_key, config.found_address, target_address);
+            break;
+        }
+
+        // Update progress
+        unsigned long long processed = 0;
+        cudaMemcpy(&processed, d_processed, sizeof(processed), cudaMemcpyDeviceToHost);
+        bump_start_by_u64(config.start_key, processed);
+        config.keys_processed += processed;
+        local_processed += processed;
+
+        // Periodic logging
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_log).count();
+
+        if (elapsed >= 5) {
+            float ms = 0;
+            cudaEventElapsedTime(&ms, start, stop);
+            double secs = ms / 1000.0;
+            double kps = (secs > 0.0) ? (processed / secs) : 0.0;
+
+            std::lock_guard<std::mutex> lock(output_mutex);
+            printf("GPU %d: %s keys/s (total: %s keys)\n",
+                config.device_id,
+                format_with_commas(static_cast<uint64_t>(kps)).c_str(),
+                format_with_commas(config.keys_processed).c_str());
+
+            last_log = now;
+        }
+
+        if (processed == 0) break;
+    }
+
+    // Cleanup
+    cudaFree(d_processed);
+    cudaFree(d_found);
+    cudaFree(d_found_key);
+    cudaFree(d_found_address);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+}
+
 // -------------------- Main --------------------
 int main(int argc, char** argv) {
     // Default values
     const char* DEFAULT_ADDRESS = "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU";
     const char* DEFAULT_START = "0000000000000000000000000000000000000000000000400000000000000000";
     const char* DEFAULT_END = "00000000000000000000000000000000000000000000007fffffffffffffffff";
-    const int DEFAULT_BLOCKS = 1024;
-    const int DEFAULT_TPB = 256;
-    const uint32_t DEFAULT_KEYS_PER_THREAD = 2048;
+
+    Config config;
+    config.intensity_level = 3;
 
     // Help flag
     if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
@@ -609,13 +845,8 @@ int main(int argc, char** argv) {
         printf("  -a, --address <addr>     Target Bitcoin address (default: %s)\n", DEFAULT_ADDRESS);
         printf("  -s, --start <hex>        Start key in hex (64 chars) (default: %s)\n", DEFAULT_START);
         printf("  -e, --end <hex>          End key in hex (64 chars) (default: %s)\n", DEFAULT_END);
-        printf("  -b, --blocks <num>       Number of blocks (default: %d)\n", DEFAULT_BLOCKS);
-        printf("  -t, --tpb <num>          Threads per block (default: %d)\n", DEFAULT_TPB);
-        printf("  -k, --keys <num>         Keys per thread (default: %u)\n", DEFAULT_KEYS_PER_THREAD);
+        printf("  -i, --intensity <lvl>    GPU intensity level (1-4, default: 3)\n");
         printf("  -h, --help               Show this help message\n");
-        printf("\nExamples:\n");
-        printf("  %s -a 1YourAddress -s 0000...0000 -e ffff...ffff\n", argv[0]);
-        printf("  %s --blocks 512 --tpb 128 --keys 1024\n", argv[0]);
         return 0;
     }
 
@@ -623,94 +854,20 @@ int main(int argc, char** argv) {
     const char* targetAddress = DEFAULT_ADDRESS;
     const char* startArg = DEFAULT_START;
     const char* endArg = DEFAULT_END;
-    int blocks = DEFAULT_BLOCKS;
-    int tpb = DEFAULT_TPB;
-    uint32_t keysPerThread = DEFAULT_KEYS_PER_THREAD;
 
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--address") == 0) {
-            if (i + 1 < argc) {
-                targetAddress = argv[++i];
-            }
-            else {
-                fprintf(stderr, "Error: Missing argument for %s\n", argv[i]);
-                return 1;
-            }
+            if (i + 1 < argc) targetAddress = argv[++i];
         }
         else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--start") == 0) {
-            if (i + 1 < argc) {
-                startArg = argv[++i];
-            }
-            else {
-                fprintf(stderr, "Error: Missing argument for %s\n", argv[i]);
-                return 1;
-            }
+            if (i + 1 < argc) startArg = argv[++i];
         }
         else if (strcmp(argv[i], "-e") == 0 || strcmp(argv[i], "--end") == 0) {
-            if (i + 1 < argc) {
-                endArg = argv[++i];
-            }
-            else {
-                fprintf(stderr, "Error: Missing argument for %s\n", argv[i]);
-                return 1;
-            }
+            if (i + 1 < argc) endArg = argv[++i];
         }
-        else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--blocks") == 0) {
-            if (i + 1 < argc) {
-                blocks = atoi(argv[++i]);
-                if (blocks <= 0) {
-                    fprintf(stderr, "Error: Blocks must be positive\n");
-                    return 1;
-                }
-            }
-            else {
-                fprintf(stderr, "Error: Missing argument for %s\n", argv[i]);
-                return 1;
-            }
-        }
-        else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--tpb") == 0) {
-            if (i + 1 < argc) {
-                tpb = atoi(argv[++i]);
-                if (tpb <= 0) {
-                    fprintf(stderr, "Error: Threads per block must be positive\n");
-                    return 1;
-                }
-            }
-            else {
-                fprintf(stderr, "Error: Missing argument for %s\n", argv[i]);
-                return 1;
-            }
-        }
-        else if (strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--keys") == 0) {
-            if (i + 1 < argc) {
-                keysPerThread = static_cast<uint32_t>(atoi(argv[++i]));
-                if (keysPerThread == 0) {
-                    fprintf(stderr, "Error: Keys per thread must be positive\n");
-                    return 1;
-                }
-            }
-            else {
-                fprintf(stderr, "Error: Missing argument for %s\n", argv[i]);
-                return 1;
-            }
-        }
-        else {
-            // Backward compatibility: if argument starts with 1, 3, or bc1, treat as address
-            if (argv[i][0] == '1' || argv[i][0] == '3' || strncmp(argv[i], "bc1", 3) == 0) {
-                targetAddress = argv[i];
-                if (i + 1 < argc && strlen(argv[i + 1]) == 64) startArg = argv[++i];
-                if (i + 1 < argc && strlen(argv[i + 1]) == 64) endArg = argv[++i];
-            }
-            // Otherwise if it's a 64-char hex string, treat as start key
-            else if (strlen(argv[i]) == 64) {
-                startArg = argv[i];
-                if (i + 1 < argc && strlen(argv[i + 1]) == 64) endArg = argv[++i];
-            }
-            else {
-                fprintf(stderr, "Error: Unknown argument: %s\n", argv[i]);
-                return 1;
-            }
+        else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--intensity") == 0) {
+            if (i + 1 < argc) config.intensity_level = atoi(argv[++i]);
         }
     }
 
@@ -721,7 +878,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // check for save file
+    // Check for save file
     Big256 loadedKey;
     bool hasSaveFile = load_saved_key(loadedKey);
     if (hasSaveFile) {
@@ -730,324 +887,416 @@ int main(int argc, char** argv) {
         std::cin >> choice;
         if (choice == 'y' || choice == 'Y') {
             if (cmp256(loadedKey, startKey) >= 0 && cmp256(loadedKey, endKey) <= 0) {
-                startKey = loadedKey;  // Update startKey if resuming
+                startKey = loadedKey;
                 printf("Resuming from saved key: 0x");
                 print_hex256(startKey);
                 printf("\n");
             }
-            else {
-                printf("Saved key is outside current search range. Starting from beginning.\n");
-            }
-        }
-        else {
-            printf("Starting from beginning.\n");
         }
     }
-
 
     // Validate address
     if (strlen(targetAddress) < 26 || strlen(targetAddress) > 35) {
-        fprintf(stderr, "Error: Invalid address length. Bitcoin addresses are typically 26-35 characters.\n");
+        fprintf(stderr, "Error: Invalid address length.\n");
         return 1;
     }
-
-
 
     if (cmp256(startKey, endKey) > 0) {
         fprintf(stderr, "Error: start key > end key.\n");
         return 1;
     }
 
-    // Validate launch configuration
-    if (tpb > 1024) {
-        fprintf(stderr, "Warning: Threads per block (%d) exceeds typical maximum of 1024\n", tpb);
-    }
+    // Get number of available GPUs
+    int device_count;
+    cudaGetDeviceCount(&device_count);
+    device_count = std::min(device_count, 8); // Limit to 8 GPUs
 
-    // Print GPU device information
+    printf("Found %d CUDA device(s)\n", device_count);
     print_device_info();
 
-    // Print search parameters
-    printf("\n=== Collision Search Parameters ===\n");
-    printf("Target address: %s\n", targetAddress);
-    printf("Start key:      0x");
-    print_hex256(startKey);
-    printf("\nEnd key:        0x");
-    print_hex256(endKey);
-    printf("\n");
-
-    // Calculate batch size
-    const uint64_t batch_keys = (uint64_t)blocks * tpb * keysPerThread;
-
-    printf("\n=== GPU Configuration ===\n");
-    printf("Blocks:          %d\n", blocks);
-    printf("Threads/block:   %d\n", tpb);
-    printf("Keys/thread:     %u\n", keysPerThread);
-    printf("Total keys/batch: %s\n", format_with_commas(batch_keys).c_str());
-    fflush(stdout);
-
-    // Device variables
-    unsigned long long* d_processed = nullptr;
-    bool* d_found = nullptr;
-    Big256* d_found_key = nullptr;
-    char* d_found_address = nullptr;
-    char h_target_address[36] = { 0 };
-
     // Precompute parameters
-    const int WINDOW_BITS = 4; // choose 4 (16 entries) default; change if you want larger windows
+    const int WINDOW_BITS = 4;
     const int precomp_table_size = (1 << WINDOW_BITS);
-    PointJ* d_precomp = nullptr;
 
-    // Initialize CUDA
-    cudaError_t cudaStatus;
+    if (device_count > 1) {
+        printf("Using multi-GPU mode with %d devices\n", device_count);
 
-    // Copy target address to device
-    strncpy(h_target_address, targetAddress, 35);
-    cudaStatus = cudaMemcpyToSymbol(d_target_address, h_target_address, 36);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpyToSymbol failed for target address: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
+        // Initialize GPU configurations
+        std::vector<GPUConfig> gpu_configs = initialize_gpu_configs(device_count, startKey, endKey, config.intensity_level);
+
+        // Create precomputation tables for each GPU
+        std::vector<PointJ*> d_precomp_tables(device_count);
+        for (int i = 0; i < device_count; i++) {
+            cudaSetDevice(i);
+            cudaMalloc(&d_precomp_tables[i], sizeof(PointJ) * precomp_table_size);
+            build_precomp_table_kernel << <1, 1 >> > (d_precomp_tables[i], precomp_table_size);
+            cudaDeviceSynchronize();
+        }
+
+        // Launch worker threads for each GPU
+        std::vector<std::thread> workers;
+        auto program_start = std::chrono::steady_clock::now();
+
+        for (int i = 0; i < device_count; i++) {
+            workers.emplace_back([&, i]() {
+                gpu_worker(gpu_configs[i], targetAddress, d_precomp_tables[i],
+                    precomp_table_size, WINDOW_BITS);
+                });
+        }
+
+        // Wait for all workers to complete
+        for (auto& worker : workers) {
+            worker.join();
+        }
+
+        auto total_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - program_start).count();
+
+        // Calculate total keys processed
+        uint64_t total_done = 0;
+        for (const auto& config : gpu_configs) {
+            total_done += config.keys_processed;
+        }
+
+        printf("\n=== Multi-GPU Search Completed ===\n");
+        printf("Total keys searched: %s\n", format_with_commas(total_done).c_str());
+        printf("Total time: %s seconds\n", format_with_commas(total_elapsed).c_str());
+        printf("Average speed: %s keys/s\n",
+            format_with_commas(static_cast<uint64_t>((total_elapsed > 0) ? total_done / total_elapsed : 0)).c_str());
+
+        // Cleanup
+        for (int i = 0; i < device_count; i++) {
+            cudaSetDevice(i);
+            cudaFree(d_precomp_tables[i]);
+        }
+
     }
+    else {
+        // Single GPU fallback
+        printf("Using single GPU mode\n");
 
-    // Allocate device memory
-    cudaStatus = cudaMalloc(&d_processed, sizeof(unsigned long long));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed for d_processed: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, 0);
 
-    cudaStatus = cudaMalloc(&d_found, sizeof(bool));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed for d_found: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
+        // Configure intensity for single GPU
+        config.blocks = 0;
+        config.tpb = 0;
+        config.keys_per_thread = 0;
 
-    cudaStatus = cudaMalloc(&d_found_key, sizeof(Big256));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed for d_found_key: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
+        int max_threads_per_mp = prop.maxThreadsPerMultiProcessor;
+        int mp_count = prop.multiProcessorCount;
 
-    cudaStatus = cudaMalloc(&d_found_address, 36 * sizeof(char));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed for d_found_address: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
+        switch (config.intensity_level) {
+        case 1: // 30% workload
+            config.blocks = (int)(mp_count * 2 * 0.4);
+            config.tpb = (int)(256 * 0.4);
+            config.keys_per_thread = (uint32_t)(1024 * 0.4);
+            break;
+        case 2: // 60% workload
+            config.blocks = (int)(mp_count * 4 * 0.8);
+            config.tpb = (int)(256 * 0.8);
+            config.keys_per_thread = (uint32_t)(1024 * 0.8);
+            break;
+        case 3: // 90% workload (default)
+            config.blocks = (int)(mp_count * 8 * 0.97);
+            config.tpb = (int)(256 * 0.97);
+            config.keys_per_thread = (uint32_t)(1024 * 0.97);
+            break;
+        case 4: // 100% workload
+            config.blocks = mp_count * 8;
+            config.tpb = 512;
+            config.keys_per_thread = 2048;
+            break;
+        default:
+            config.blocks = (int)(mp_count * 8 * 0.97);
+            config.tpb = (int)(256 * 0.97);
+            config.keys_per_thread = (uint32_t)(1024 * 0.97);
+            break;
+        }
 
-    // Allocate device precomp table
-    cudaStatus = cudaMalloc(&d_precomp, sizeof(PointJ) * precomp_table_size);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed for d_precomp: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
+        config.blocks = std::max(1, config.blocks);
+        config.tpb = std::max(32, config.tpb);
+        config.keys_per_thread = std::max(1u, config.keys_per_thread);
 
-    // Build precomp table on device
-    build_precomp_table_kernel << <1, 1 >> > (d_precomp, precomp_table_size);
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "build_precomp_table_kernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
-    cudaStatus = cudaDeviceSynchronize();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceSynchronize failed after precomp build: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
+        if (config.intensity_level != 4) {
+            config.tpb = std::min(config.tpb, prop.maxThreadsPerBlock);
+            config.blocks = std::min(config.blocks, 65535);
+        }
+        else {
+            config.blocks = std::min(config.blocks, 65535);
+        }
 
-    // Initialize device variables
-    unsigned long long zero = 0;
-    bool false_val = false;
-    cudaStatus = cudaMemcpy(d_processed, &zero, sizeof(zero), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed for d_processed: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
+        // Print search parameters
+        printf("\n=== Collision Search Parameters ===\n");
+        printf("Target address: %s\n", targetAddress);
+        printf("Start key:      0x");
+        print_hex256(startKey);
+        printf("\nEnd key:        0x");
+        print_hex256(endKey);
+        printf("\nIntensity level: %d\n", config.intensity_level);
 
-    cudaStatus = cudaMemcpy(d_found, &false_val, sizeof(false_val), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed for d_found: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
+        // Calculate batch size
+        const uint64_t batch_keys = (uint64_t)config.blocks * config.tpb * config.keys_per_thread;
 
-    // Timing
-    cudaEvent_t start, stop;
-    cudaStatus = cudaEventCreate(&start);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaEventCreate failed for start: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
+        printf("\n=== GPU Configuration ===\n");
+        printf("Blocks:          %d\n", config.blocks);
+        printf("Threads/block:   %d\n", config.tpb);
+        printf("Keys/thread:     %u\n", config.keys_per_thread);
+        printf("Total keys/batch: %s\n", format_with_commas(batch_keys).c_str());
+        fflush(stdout);
 
-    cudaStatus = cudaEventCreate(&stop);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaEventCreate failed for stop: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
+        // Device variables
+        unsigned long long* d_processed = nullptr;
+        bool* d_found = nullptr;
+        Big256* d_found_key = nullptr;
+        char* d_found_address = nullptr;
+        PointJ* d_precomp = nullptr;
 
-    auto program_start = std::chrono::steady_clock::now();
-    auto last_log = program_start;
-    uint64_t total_done = 0;
-    uint64_t total_since_last = 0;
-    int iter = 0;
+        // Initialize CUDA
+        cudaError_t cudaStatus;
 
-    printf("\n=== Starting Search ===\n");
-    auto last_save = std::chrono::steady_clock::now();
-    while (cmp256(startKey, endKey) <= 0) {
-        // Reset counters
+        // Copy target address to device
+        char h_target_address[36] = { 0 };
+        strncpy(h_target_address, targetAddress, 35);
+        cudaStatus = cudaMemcpyToSymbol(d_target_address, h_target_address, 36);
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "cudaMemcpyToSymbol failed for target address: %s\n", cudaGetErrorString(cudaStatus));
+            goto Error;
+        }
+
+        // Allocate device memory
+        cudaStatus = cudaMalloc(&d_processed, sizeof(unsigned long long));
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "cudaMalloc failed for d_processed: %s\n", cudaGetErrorString(cudaStatus));
+            goto Error;
+        }
+
+        cudaStatus = cudaMalloc(&d_found, sizeof(bool));
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "cudaMalloc failed for d_found: %s\n", cudaGetErrorString(cudaStatus));
+            goto Error;
+        }
+
+        cudaStatus = cudaMalloc(&d_found_key, sizeof(Big256));
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "cudaMalloc failed for d_found_key: %s\n", cudaGetErrorString(cudaStatus));
+            goto Error;
+        }
+
+        cudaStatus = cudaMalloc(&d_found_address, 36 * sizeof(char));
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "cudaMalloc failed for d_found_address: %s\n", cudaGetErrorString(cudaStatus));
+            goto Error;
+        }
+
+        // Allocate device precomp table
+        cudaStatus = cudaMalloc(&d_precomp, sizeof(PointJ) * precomp_table_size);
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "cudaMalloc failed for d_precomp: %s\n", cudaGetErrorString(cudaStatus));
+            goto Error;
+        }
+
+        // Build precomp table on device
+        build_precomp_table_kernel << <1, 1 >> > (d_precomp, precomp_table_size);
+        cudaStatus = cudaGetLastError();
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "build_precomp_table_kernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+            goto Error;
+        }
+        cudaStatus = cudaDeviceSynchronize();
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "cudaDeviceSynchronize failed after precomp build: %s\n", cudaGetErrorString(cudaStatus));
+            goto Error;
+        }
+
+        // Initialize device variables
+        unsigned long long zero = 0;
+        bool false_val = false;
         cudaStatus = cudaMemcpy(d_processed, &zero, sizeof(zero), cudaMemcpyHostToDevice);
         if (cudaStatus != cudaSuccess) {
-            fprintf(stderr, "cudaMemcpy failed for d_processed reset: %s\n", cudaGetErrorString(cudaStatus));
-            break;
+            fprintf(stderr, "cudaMemcpy failed for d_processed: %s\n", cudaGetErrorString(cudaStatus));
+            goto Error;
         }
 
         cudaStatus = cudaMemcpy(d_found, &false_val, sizeof(false_val), cudaMemcpyHostToDevice);
         if (cudaStatus != cudaSuccess) {
-            fprintf(stderr, "cudaMemcpy failed for d_found reset: %s\n", cudaGetErrorString(cudaStatus));
-            break;
+            fprintf(stderr, "cudaMemcpy failed for d_found: %s\n", cudaGetErrorString(cudaStatus));
+            goto Error;
         }
 
-        // Run kernel
-        cudaStatus = cudaEventRecord(start);
+        // Timing
+        cudaEvent_t start, stop;
+        cudaStatus = cudaEventCreate(&start);
         if (cudaStatus != cudaSuccess) {
-            fprintf(stderr, "cudaEventRecord failed for start: %s\n", cudaGetErrorString(cudaStatus));
-            break;
+            fprintf(stderr, "cudaEventCreate failed for start: %s\n", cudaGetErrorString(cudaStatus));
+            goto Error;
         }
 
-        // Launch with precomputed table pointer and window params
-        collision_kernel << <blocks, tpb >> > (startKey, endKey, keysPerThread,
-            d_processed, d_found, d_found_key, d_found_address,
-            d_precomp, precomp_table_size, WINDOW_BITS);
-
-        cudaStatus = cudaGetLastError();
+        cudaStatus = cudaEventCreate(&stop);
         if (cudaStatus != cudaSuccess) {
-            fprintf(stderr, "collision_kernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-            break;
+            fprintf(stderr, "cudaEventCreate failed for stop: %s\n", cudaGetErrorString(cudaStatus));
+            goto Error;
         }
 
-        cudaStatus = cudaEventRecord(stop);
-        if (cudaStatus != cudaSuccess) {
-            fprintf(stderr, "cudaEventRecord failed for stop: %s\n", cudaGetErrorString(cudaStatus));
-            break;
-        }
+        auto program_start = std::chrono::steady_clock::now();
+        auto last_log = program_start;
+        uint64_t total_done = 0;
+        uint64_t total_since_last = 0;
+        auto last_save = std::chrono::steady_clock::now();
 
-        cudaStatus = cudaEventSynchronize(stop);
-        if (cudaStatus != cudaSuccess) {
-            fprintf(stderr, "cudaEventSynchronize failed: %s\n", cudaGetErrorString(cudaStatus));
-            break;
-        }
-
-        // Check for collision
-        bool found = false;
-        cudaStatus = cudaMemcpy(&found, d_found, sizeof(found), cudaMemcpyDeviceToHost);
-        if (cudaStatus != cudaSuccess) {
-            fprintf(stderr, "cudaMemcpy failed for d_found read: %s\n", cudaGetErrorString(cudaStatus));
-            break;
-        }
-
-        if (found) {
-            Big256 found_key;
-            char found_address[36] = { 0 };
-            cudaStatus = cudaMemcpy(&found_key, d_found_key, sizeof(found_key), cudaMemcpyDeviceToHost);
+        printf("\n=== Starting Search ===\n");
+        while (cmp256(startKey, endKey) <= 0 && !global_found.load()) {
+            // Reset counters
+            cudaStatus = cudaMemcpy(d_processed, &zero, sizeof(zero), cudaMemcpyHostToDevice);
             if (cudaStatus != cudaSuccess) {
-                fprintf(stderr, "cudaMemcpy failed for found_key: %s\n", cudaGetErrorString(cudaStatus));
+                fprintf(stderr, "cudaMemcpy failed for d_processed reset: %s\n", cudaGetErrorString(cudaStatus));
                 break;
             }
 
-            cudaStatus = cudaMemcpy(found_address, d_found_address, 36, cudaMemcpyDeviceToHost);
+            cudaStatus = cudaMemcpy(d_found, &false_val, sizeof(false_val), cudaMemcpyHostToDevice);
             if (cudaStatus != cudaSuccess) {
-                fprintf(stderr, "cudaMemcpy failed for found_address: %s\n", cudaGetErrorString(cudaStatus));
+                fprintf(stderr, "cudaMemcpy failed for d_found reset: %s\n", cudaGetErrorString(cudaStatus));
                 break;
             }
 
-            printf("\n=== COLLISION FOUND ===\n");
-            printf("Private key: 0x");
-            print_hex256(found_key);
-            printf("\nAddress: %s\n", found_address);
-            printf("Matches target: %s\n", targetAddress);
-
-            // Save collision result to file
-            save_collision_result(found_key, found_address, targetAddress);
-            break;
-        }
-
-        // Get processed count
-        unsigned long long processed = 0;
-        cudaStatus = cudaMemcpy(&processed, d_processed, sizeof(processed), cudaMemcpyDeviceToHost);
-        if (cudaStatus != cudaSuccess) {
-            fprintf(stderr, "cudaMemcpy failed for d_processed read: %s\n", cudaGetErrorString(cudaStatus));
-            break;
-        }
-
-        // Update position
-        bump_start_by_u64(startKey, processed);
-        total_done += processed;
-        total_since_last += processed;
-
-        // Performance metrics
-        float ms = 0;
-        cudaStatus = cudaEventElapsedTime(&ms, start, stop);
-        if (cudaStatus != cudaSuccess) {
-            fprintf(stderr, "cudaEventElapsedTime failed: %s\n", cudaGetErrorString(cudaStatus));
-            break;
-        }
-
-        double secs = ms / 1000.0;
-        double kps = (secs > 0.0) ? (processed / secs) : 0.0;
-
-        // Log progress
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_log).count();
-
-        // Save progress every 30 seconds
-        auto time_since_save = std::chrono::duration_cast<std::chrono::seconds>(now - last_save).count();
-        if (time_since_save >= 30) {
-            if (save_current_key(startKey)) {
-                printf("Progress saved at key: 0x");
-                print_hex256(startKey);
-                printf("\n");
+            // Run kernel
+            cudaStatus = cudaEventRecord(start);
+            if (cudaStatus != cudaSuccess) {
+                fprintf(stderr, "cudaEventRecord failed for start: %s\n", cudaGetErrorString(cudaStatus));
+                break;
             }
-            else {
-                printf("Warning: Failed to save progress\n");
+
+            collision_kernel << <config.blocks, config.tpb >> > (startKey, endKey, config.keys_per_thread,
+                d_processed, d_found, d_found_key, d_found_address,
+                d_precomp, precomp_table_size, WINDOW_BITS);
+
+            cudaStatus = cudaGetLastError();
+            if (cudaStatus != cudaSuccess) {
+                fprintf(stderr, "collision_kernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+                break;
             }
-            last_save = now;
+
+            cudaStatus = cudaEventRecord(stop);
+            if (cudaStatus != cudaSuccess) {
+                fprintf(stderr, "cudaEventRecord failed for stop: %s\n", cudaGetErrorString(cudaStatus));
+                break;
+            }
+
+            cudaStatus = cudaEventSynchronize(stop);
+            if (cudaStatus != cudaSuccess) {
+                fprintf(stderr, "cudaEventSynchronize failed: %s\n", cudaGetErrorString(cudaStatus));
+                break;
+            }
+
+            // Check for collision
+            bool found = false;
+            cudaStatus = cudaMemcpy(&found, d_found, sizeof(found), cudaMemcpyDeviceToHost);
+            if (cudaStatus != cudaSuccess) {
+                fprintf(stderr, "cudaMemcpy failed for d_found read: %s\n", cudaGetErrorString(cudaStatus));
+                break;
+            }
+
+            if (found) {
+                Big256 found_key;
+                char found_address[36] = { 0 };
+                cudaStatus = cudaMemcpy(&found_key, d_found_key, sizeof(found_key), cudaMemcpyDeviceToHost);
+                if (cudaStatus != cudaSuccess) {
+                    fprintf(stderr, "cudaMemcpy failed for found_key: %s\n", cudaGetErrorString(cudaStatus));
+                    break;
+                }
+
+                cudaStatus = cudaMemcpy(found_address, d_found_address, 36, cudaMemcpyDeviceToHost);
+                if (cudaStatus != cudaSuccess) {
+                    fprintf(stderr, "cudaMemcpy failed for found_address: %s\n", cudaGetErrorString(cudaStatus));
+                    break;
+                }
+
+                printf("\n=== COLLISION FOUND ===\n");
+                printf("Private key: 0x");
+                print_hex256(found_key);
+                printf("\nAddress: %s\n", found_address);
+                printf("Matches target: %s\n", targetAddress);
+
+                save_collision_result(found_key, found_address, targetAddress);
+                global_found.store(true);
+                break;
+            }
+
+            // Get processed count
+            unsigned long long processed = 0;
+            cudaStatus = cudaMemcpy(&processed, d_processed, sizeof(processed), cudaMemcpyDeviceToHost);
+            if (cudaStatus != cudaSuccess) {
+                fprintf(stderr, "cudaMemcpy failed for d_processed read: %s\n", cudaGetErrorString(cudaStatus));
+                break;
+            }
+
+            // Update position
+            bump_start_by_u64(startKey, processed);
+            total_done += processed;
+            total_since_last += processed;
+
+            // Performance metrics
+            float ms = 0;
+            cudaStatus = cudaEventElapsedTime(&ms, start, stop);
+            if (cudaStatus != cudaSuccess) {
+                fprintf(stderr, "cudaEventElapsedTime failed: %s\n", cudaGetErrorString(cudaStatus));
+                break;
+            }
+
+            double secs = ms / 1000.0;
+            double kps = (secs > 0.0) ? (processed / secs) : 0.0;
+
+            // Log progress
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_log).count();
+
+            // Save progress every 30 seconds
+            auto time_since_save = std::chrono::duration_cast<std::chrono::seconds>(now - last_save).count();
+            if (time_since_save >= 30) {
+                if (save_current_key(startKey)) {
+                    printf("Progress saved at key: 0x");
+                    print_hex256(startKey);
+                    printf("\n");
+                }
+                last_save = now;
+            }
+
+            if (elapsed >= 10) {
+                double total_elapsed_time = std::chrono::duration<double>(now - program_start).count();
+                double avg_kps = (total_elapsed_time > 0.0) ? (total_done / total_elapsed_time) : 0.0;
+                double recent_kps = (elapsed > 0) ? (total_since_last / elapsed) : 0.0;
+
+                printf("[%.0fs] Total: %s keys | Avg: %s keys/s | Recent: %s keys/s\n",
+                    total_elapsed_time,
+                    format_with_commas(total_done).c_str(),
+                    format_with_commas(static_cast<uint64_t>(avg_kps)).c_str(),
+                    format_with_commas(static_cast<uint64_t>(recent_kps)).c_str());
+
+                fflush(stdout);
+
+                last_log = now;
+                total_since_last = 0;
+            }
+
+            if (processed == 0) break;
         }
 
-        if (elapsed >= 10) {
-            double total_elapsed = std::chrono::duration<double>(now - program_start).count();
-            double avg_kps = (total_elapsed > 0.0) ? (total_done / total_elapsed) : 0.0;
-            double recent_kps = (elapsed > 0) ? (total_since_last / elapsed) : 0.0;
+        auto total_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - program_start).count();
+        printf("\n=== Search Completed ===\n");
+        printf("Total keys searched: %s\n", format_with_commas(total_done).c_str());
+        printf("Total time: %s seconds\n", format_with_commas(total_elapsed).c_str());
+        printf("Average speed: %s keys/s\n",
+            format_with_commas(static_cast<uint64_t>((total_elapsed > 0) ? total_done / (double)total_elapsed : 0)).c_str());
 
-            printf("[%.0fs] Total: %s keys | Avg: %s keys/s | Recent: %s keys/s\n",
-                total_elapsed,
-                format_with_commas(total_done).c_str(),
-                format_with_commas(static_cast<uint64_t>(avg_kps)).c_str(),
-                format_with_commas(static_cast<uint64_t>(recent_kps)).c_str());
-
-            fflush(stdout);
-
-            last_log = now;
-            total_since_last = 0;
-        }
-
-        if (processed == 0) break;
-        iter++;
+    Error:
+        // Cleanup
+        if (d_processed) cudaFree(d_processed);
+        if (d_found) cudaFree(d_found);
+        if (d_found_key) cudaFree(d_found_key);
+        if (d_found_address) cudaFree(d_found_address);
+        if (d_precomp) cudaFree(d_precomp);
     }
-
-    auto total_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::steady_clock::now() - program_start).count();
-    printf("\n=== Search Completed ===\n");
-    printf("Total keys searched: %s\n", format_with_commas(total_done).c_str());
-    printf("Total time: %s seconds\n", format_with_commas(total_elapsed).c_str());
-    printf("Average speed: %s keys/s\n",
-        format_with_commas(static_cast<uint64_t>((total_elapsed > 0) ? total_done / (double)total_elapsed : 0)).c_str());
-
-Error:
-    // Cleanup
-    if (d_processed) cudaFree(d_processed);
-    if (d_found) cudaFree(d_found);
-    if (d_found_key) cudaFree(d_found_key);
-    if (d_found_address) cudaFree(d_found_address);
-    if (d_precomp) cudaFree(d_precomp);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
 
     cudaDeviceReset();
     return 0;
