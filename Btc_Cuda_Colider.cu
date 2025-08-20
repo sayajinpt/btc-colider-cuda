@@ -640,17 +640,17 @@ void configure_intensity(GPUConfig& config, cudaDeviceProp& prop) {
     uint32_t target_keys = 1024;
 
     switch (config.intensity_level) {
-    case 1: // 30% workload
+    case 1: // 40% workload
         target_blocks = (int)(mp_count * 2 * 0.4);
         target_tpb = (int)(256 * 0.4);
         target_keys = (uint32_t)(1024 * 0.4);
         break;
-    case 2: // 60% workload
+    case 2: // 80% workload
         target_blocks = (int)(mp_count * 4 * 0.8);
         target_tpb = (int)(256 * 0.8);
         target_keys = (uint32_t)(1024 * 0.8);
         break;
-    case 3: // 90% workload (default)
+    case 3: // 97% workload (default)
         target_blocks = (int)(mp_count * 8 * 0.97);
         target_tpb = (int)(256 * 0.97);
         target_keys = (uint32_t)(1024 * 0.97);
@@ -987,17 +987,17 @@ int main(int argc, char** argv) {
         int mp_count = prop.multiProcessorCount;
 
         switch (config.intensity_level) {
-        case 1: // 30% workload
+        case 1: // 40% workload
             config.blocks = (int)(mp_count * 2 * 0.4);
             config.tpb = (int)(256 * 0.4);
             config.keys_per_thread = (uint32_t)(1024 * 0.4);
             break;
-        case 2: // 60% workload
+        case 2: // 80% workload
             config.blocks = (int)(mp_count * 4 * 0.8);
             config.tpb = (int)(256 * 0.8);
             config.keys_per_thread = (uint32_t)(1024 * 0.8);
             break;
-        case 3: // 90% workload (default)
+        case 3: // 97% workload (default)
             config.blocks = (int)(mp_count * 8 * 0.97);
             config.tpb = (int)(256 * 0.97);
             config.keys_per_thread = (uint32_t)(1024 * 0.97);
