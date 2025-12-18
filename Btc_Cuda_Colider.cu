@@ -17,11 +17,18 @@
 #include "device_launch_parameters.h"
 
 // -------------------- Configuration --------------------
+enum AddressType {
+    ADDRESS_UNCOMPRESSED = 0,
+    ADDRESS_COMPRESSED = 1,
+    ADDRESS_BOTH = 2
+};
+
 struct Config {
     int intensity_level = 3;  // Default intensity (90%)
     int blocks = 0;           // Will be calculated based on intensity
     int tpb = 0;              // Will be calculated based on intensity
     uint32_t keys_per_thread = 0; // Will be calculated based on intensity
+    AddressType address_type = ADDRESS_BOTH;  // Default to both
 };
 
 // -------------------- Big ints --------------------
@@ -41,6 +48,7 @@ struct GPUConfig {
     bool found;
     Big256 found_key;
     char found_address[36];
+    AddressType address_type;
 };
 
 // -------------------- Global Variables --------------------
@@ -395,6 +403,67 @@ __device__ bool point_to_address_uncompressed(const PointJ& P, char outB58[36], 
     return true;
 }
 
+// -------------------- Address from Point (compressed) --------------------
+__device__ bool point_to_address_compressed(const PointJ& P, char outB58[36], const char* target_address) {
+    Big256 x, y; from_jac(P, x, y);
+
+    // Serialize compressed: 0x02 if y is even, 0x03 if y is odd
+    uint8_t pub[33];
+    pub[0] = (y.w[0] & 1) ? 0x03 : 0x02;  // Check LSB of y for even/odd
+
+    for (int wi = 0; wi < 8; wi++) {
+        uint32_t wx = x.w[7 - wi];
+        pub[1 + wi * 4] = (uint8_t)(wx >> 24);
+        pub[2 + wi * 4] = (uint8_t)(wx >> 16);
+        pub[3 + wi * 4] = (uint8_t)(wx >> 8);
+        pub[4 + wi * 4] = (uint8_t)wx;
+    }
+
+    uint8_t sha[32]; sha256_cuda(pub, 33, sha);
+    uint8_t rh[20];  ripemd160_cuda(sha, 32, rh);
+
+    uint8_t payload[21]; payload[0] = 0x00; memcpy(payload + 1, rh, 20);
+    uint8_t chk1[32], chk2[32]; sha256_cuda(payload, 21, chk1); sha256_cuda(chk1, 32, chk2);
+
+    uint8_t addrBytes[25]; memcpy(addrBytes, payload, 21); memcpy(addrBytes + 21, chk2, 4);
+
+    // Encode to Base58
+    base58_encode(addrBytes, 25, outB58);
+
+    // Compare with target address
+    for (int i = 0; target_address[i] != '\0'; i++) {
+        if (outB58[i] != target_address[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// -------------------- Unified address checking --------------------
+__device__ bool point_to_address(const PointJ& P, char outB58[36], const char* target_address, AddressType addr_type) {
+    if (addr_type == ADDRESS_UNCOMPRESSED) {
+        return point_to_address_uncompressed(P, outB58, target_address);
+    }
+    else if (addr_type == ADDRESS_COMPRESSED) {
+        return point_to_address_compressed(P, outB58, target_address);
+    }
+    else { // ADDRESS_BOTH
+        char uncompressed[36], compressed[36];
+        bool found_uncompressed = point_to_address_uncompressed(P, uncompressed, target_address);
+        bool found_compressed = point_to_address_compressed(P, compressed, target_address);
+
+        if (found_uncompressed) {
+            memcpy(outB58, uncompressed, 36);
+            return true;
+        }
+        else if (found_compressed) {
+            memcpy(outB58, compressed, 36);
+            return true;
+        }
+        return false;
+    }
+}
+
 // -------------------- Precompute & windowed multiply --------------------
 
 // Build a small table T[d] = d * G for d = 0..table_size-1
@@ -453,7 +522,7 @@ __device__ inline void scalar_mul_windowed_precomp(const Big256& k, PointJ& out,
 extern "C" __global__
 void collision_kernel(Big256 startKey, Big256 endKey, uint32_t keysPerThread,
     unsigned long long* processed_out, bool* found, Big256* found_key, char* found_address,
-    const PointJ* precomp_table, int precomp_table_size, int window_bits)
+    const PointJ* precomp_table, int precomp_table_size, int window_bits, AddressType address_type)
 {
     const uint64_t gid = blockDim.x * (uint64_t)blockIdx.x + threadIdx.x;
 
@@ -475,7 +544,7 @@ void collision_kernel(Big256 startKey, Big256 endKey, uint32_t keysPerThread,
         if (cmp256(priv, endKey) > 0 || *found) break;
 
         // Compute address and check for collision
-        if (point_to_address_uncompressed(P, address, d_target_address)) {
+        if (point_to_address(P, address, d_target_address, address_type)) {
             // Collision found!
             *found = true;
             *found_key = priv;
@@ -681,7 +750,7 @@ void configure_intensity(GPUConfig& config, cudaDeviceProp& prop) {
 }
 
 std::vector<GPUConfig> initialize_gpu_configs(int device_count, const Big256& startKey,
-    const Big256& endKey, int intensity_level) {
+    const Big256& endKey, int intensity_level, AddressType address_type) {
     std::vector<GPUConfig> configs(device_count);
 
     // Calculate approximate total range
@@ -694,6 +763,7 @@ std::vector<GPUConfig> initialize_gpu_configs(int device_count, const Big256& st
         GPUConfig& config = configs[i];
         config.device_id = i;
         config.intensity_level = intensity_level;
+        config.address_type = address_type;
 
         // Set key ranges
         if (i == 0) {
@@ -763,7 +833,7 @@ void gpu_worker(GPUConfig& config, const char* target_address,
         collision_kernel << <config.blocks, config.tpb >> > (
             config.start_key, config.end_key, config.keys_per_thread,
             d_processed, d_found, d_found_key, d_found_address,
-            d_precomp, precomp_table_size, window_bits
+            d_precomp, precomp_table_size, window_bits, config.address_type
             );
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
@@ -837,6 +907,7 @@ int main(int argc, char** argv) {
 
     Config config;
     config.intensity_level = 3;
+    config.address_type = ADDRESS_BOTH;
 
     // Help flag
     if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
@@ -846,6 +917,7 @@ int main(int argc, char** argv) {
         printf("  -s, --start <hex>        Start key in hex (64 chars) (default: %s)\n", DEFAULT_START);
         printf("  -e, --end <hex>          End key in hex (64 chars) (default: %s)\n", DEFAULT_END);
         printf("  -i, --intensity <lvl>    GPU intensity level (1-4, default: 3)\n");
+        printf("  -t, --type <type>        Address type: uncompressed, compressed, or both (default: both)\n");
         printf("  -h, --help               Show this help message\n");
         return 0;
     }
@@ -868,6 +940,24 @@ int main(int argc, char** argv) {
         }
         else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--intensity") == 0) {
             if (i + 1 < argc) config.intensity_level = atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--type") == 0) {
+            if (i + 1 < argc) {
+                std::string type_str = argv[++i];
+                if (type_str == "uncompressed") {
+                    config.address_type = ADDRESS_UNCOMPRESSED;
+                }
+                else if (type_str == "compressed") {
+                    config.address_type = ADDRESS_COMPRESSED;
+                }
+                else if (type_str == "both") {
+                    config.address_type = ADDRESS_BOTH;
+                }
+                else {
+                    fprintf(stderr, "Invalid address type. Use: uncompressed, compressed, or both\n");
+                    return 1;
+                }
+            }
         }
     }
 
@@ -914,6 +1004,15 @@ int main(int argc, char** argv) {
     printf("Found %d CUDA device(s)\n", device_count);
     print_device_info();
 
+    // Print address type info
+    const char* addr_type_str = "";
+    switch (config.address_type) {
+    case ADDRESS_UNCOMPRESSED: addr_type_str = "uncompressed"; break;
+    case ADDRESS_COMPRESSED: addr_type_str = "compressed"; break;
+    case ADDRESS_BOTH: addr_type_str = "both uncompressed and compressed"; break;
+    }
+    printf("Address type: %s\n", addr_type_str);
+
     // Precompute parameters
     const int WINDOW_BITS = 4;
     const int precomp_table_size = (1 << WINDOW_BITS);
@@ -922,7 +1021,7 @@ int main(int argc, char** argv) {
         printf("Using multi-GPU mode with %d devices\n", device_count);
 
         // Initialize GPU configurations
-        std::vector<GPUConfig> gpu_configs = initialize_gpu_configs(device_count, startKey, endKey, config.intensity_level);
+        std::vector<GPUConfig> gpu_configs = initialize_gpu_configs(device_count, startKey, endKey, config.intensity_level, config.address_type);
 
         // Create precomputation tables for each GPU
         std::vector<PointJ*> d_precomp_tables(device_count);
@@ -1034,6 +1133,7 @@ int main(int argc, char** argv) {
         printf("\nEnd key:        0x");
         print_hex256(endKey);
         printf("\nIntensity level: %d\n", config.intensity_level);
+        printf("Address type:   %s\n", addr_type_str);
 
         // Calculate batch size
         const uint64_t batch_keys = (uint64_t)config.blocks * config.tpb * config.keys_per_thread;
@@ -1168,7 +1268,7 @@ int main(int argc, char** argv) {
 
             collision_kernel << <config.blocks, config.tpb >> > (startKey, endKey, config.keys_per_thread,
                 d_processed, d_found, d_found_key, d_found_address,
-                d_precomp, precomp_table_size, WINDOW_BITS);
+                d_precomp, precomp_table_size, WINDOW_BITS, config.address_type);
 
             cudaStatus = cudaGetLastError();
             if (cudaStatus != cudaSuccess) {
