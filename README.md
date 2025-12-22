@@ -7,7 +7,8 @@ multi gpu suport (not tested)
 
 here some benchmarks on my gpu nvidia 3060 producing around 20 million keys processed per second.
 
-<img width="1226" height="984" alt="Captura de Ecrã (30)" src="https://github.com/user-attachments/assets/f1a75589-deca-43e2-bf71-9f43bce6f656" />
+<img width="1874" height="965" alt="Captura de Ecrã (34)" src="https://github.com/user-attachments/assets/4f2a5619-a58a-4931-8e90-4fa0b490fb9d" />
+
 
 ====
 
